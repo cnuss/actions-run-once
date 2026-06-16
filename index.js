@@ -10,19 +10,29 @@
 // is finalized, then download the winner's output. Everyone ends with the same
 // `output`, and a non-zero winner exit is mirrored to every racer.
 //
-// Dependency-free: no @actions/* packages, no node_modules, no build step.
-// Runs as a node24 action so the runner injects ACTIONS_RUNTIME_TOKEN /
-// ACTIONS_RESULTS_URL into this process (it withholds them from `run:` shells).
+// Implementation notes:
+//   - Dependency-free: no @actions/* packages, no node_modules, no build step.
+//     Runs as a node24 action so the runner injects ACTIONS_RUNTIME_TOKEN /
+//     ACTIONS_RESULTS_URL (it withholds them from `run:` shells).
+//   - Every request uses a FRESH TCP socket (agent: false). The cache service
+//     sits behind eventually-consistent read replicas; a keep-alive connection
+//     pins a poller to ONE replica, so if that replica lags behind the winner's
+//     finalize the loser can stall for minutes. A new socket per poll lets the
+//     load balancer rotate us onto a replica that has already ingested it.
 
 const fs = require('fs');
+const https = require('https');
 const crypto = require('crypto');
+const { URL } = require('url');
 const { spawnSync } = require('child_process');
 
 const ENVELOPE_VERSION = 'run-once-v1';
-const POLL_INTERVAL_MS = 2000;
+const POLL_INTERVAL_MS = 1500;
+const DOWNLOAD_RETRIES = 6;
 
 function log(msg) { process.stdout.write(`${msg}\n`); }
 function fail(msg) { log(`::error::${msg}`); process.exitCode = 1; }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 function getInput(name) {
   const v = process.env[`INPUT_${name.toUpperCase().replace(/ /g, '_')}`];
@@ -42,22 +52,43 @@ function versionFor(key) {
   return crypto.createHash('sha256').update(`${ENVELOPE_VERSION}:${key}`).digest('hex');
 }
 
-async function twirp(base, method, body, token) {
-  const res = await fetch(`${base}/${method}`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+// One request, one fresh socket. No keep-alive -> no replica stickiness.
+function request(method, urlStr, headers, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const data = body == null ? null : (Buffer.isBuffer(body) ? body : Buffer.from(body));
+    const opts = {
+      method,
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      headers: { 'Connection': 'close', ...headers },
+      agent: false,
+    };
+    if (data) opts.headers['Content-Length'] = data.length;
+    const req = https.request(opts, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        resolve({ status: res.statusCode, text: buf.toString('utf8'), buffer: buf });
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
   });
-  const text = await res.text();
-  let json = {};
-  try { json = text ? JSON.parse(text) : {}; } catch { /* leave {} */ }
-  return { status: res.status, json, text };
 }
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function twirp(base, method, body, token) {
+  const res = await request('POST', `${base}/${method}`, {
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  }, JSON.stringify(body));
+  let json = {};
+  try { json = res.text ? JSON.parse(res.text) : {}; } catch { /* leave {} */ }
+  return { status: res.status, json, text: res.text };
+}
 
 async function main() {
   const key = getInput('key');
@@ -92,7 +123,6 @@ async function main() {
 }
 
 async function runAsWinner({ base, token, key, version, script, uploadUrl }) {
-  // Run the script. Stream its output to our log so it's visible live-ish.
   const child = spawnSync('bash', ['-c', script], {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -107,12 +137,11 @@ async function runAsWinner({ base, token, key, version, script, uploadUrl }) {
   const envelope = JSON.stringify({ v: ENVELOPE_VERSION, exit, output: stdout });
   const bytes = Buffer.from(envelope, 'utf8');
 
-  const put = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { 'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/octet-stream' },
-    body: bytes,
-  });
-  if (!put.ok) return fail(`blob upload failed: HTTP ${put.status}`);
+  const put = await request('PUT', uploadUrl, {
+    'x-ms-blob-type': 'BlockBlob',
+    'Content-Type': 'application/octet-stream',
+  }, bytes);
+  if (put.status < 200 || put.status >= 300) return fail(`blob upload failed: HTTP ${put.status}`);
 
   const final = await twirp(base, 'FinalizeCacheEntryUpload',
     { key, version, size_bytes: bytes.length }, token);
@@ -124,24 +153,38 @@ async function runAsWinner({ base, token, key, version, script, uploadUrl }) {
 }
 
 async function runAsLoser({ base, token, key, version, timeoutSeconds }) {
-  const deadline = Date.now() + timeoutSeconds * 1000;
+  const start = Date.now();
+  const deadline = start + timeoutSeconds * 1000;
   let downloadUrl = '';
+  let polls = 0;
+
+  // Poll for visibility. Fresh socket per call rotates replicas.
   while (Date.now() < deadline) {
+    polls += 1;
     const dl = await twirp(base, 'GetCacheEntryDownloadURL',
       { key, version, restore_keys: [] }, token);
     if (dl.json.ok === true) {
       downloadUrl = dl.json.signed_download_url || dl.json.signedDownloadUrl;
+      log(`[run-once] entry visible after ${polls} polls / ${Math.round((Date.now() - start) / 1000)}s`);
       break;
     }
+    if (polls % 10 === 0) log(`[run-once] still waiting (${polls} polls, ${Math.round((Date.now() - start) / 1000)}s)`);
     await sleep(POLL_INTERVAL_MS);
   }
   if (!downloadUrl) {
     return fail(`timed out after ${timeoutSeconds}s waiting for key="${key}" to finalize`);
   }
 
-  const res = await fetch(downloadUrl);
-  if (!res.ok) return fail(`blob download failed: HTTP ${res.status}`);
-  const text = await res.text();
+  // Blob read can lag the metadata; retry on non-200 (e.g. BlobNotFound).
+  let text = '';
+  for (let i = 1; i <= DOWNLOAD_RETRIES; i += 1) {
+    const res = await request('GET', downloadUrl, {}, null);
+    if (res.status === 200) { text = res.text; break; }
+    if (i === DOWNLOAD_RETRIES) return fail(`blob download failed after ${i} tries: HTTP ${res.status}`);
+    log(`[run-once] blob not ready (HTTP ${res.status}), retry ${i}/${DOWNLOAD_RETRIES}`);
+    await sleep(POLL_INTERVAL_MS);
+  }
+
   let envelope;
   try { envelope = JSON.parse(text); } catch { return fail(`winner envelope is not JSON: ${text.slice(0, 200)}`); }
 

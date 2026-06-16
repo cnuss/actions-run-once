@@ -32,8 +32,9 @@ const ENVELOPE_VERSION = 'run-once-v1';
 // first replica that has ingested the winner's finalize wins the race. This
 // turns convergence from "slowest replica I happen to poll" into "fastest
 // replica in the fleet". RELAUNCH_DELAY_MS paces each slot after a miss.
-const POLL_WIDTH = 8;
-const RELAUNCH_DELAY_MS = 1000;
+const POLL_WIDTH = 16;
+const RELAUNCH_DELAY_MS = 250;
+const BACKOFF_DELAY_MS = 2000; // when the service rate-limits / errors (429/5xx)
 const DOWNLOAD_RETRIES = 6;
 const DOWNLOAD_RETRY_DELAY_MS = 1000;
 
@@ -188,8 +189,11 @@ function raceForVisibility({ base, token, key, version, deadline }) {
             settle(url);
             return;
           }
-          if (n % 20 === 0) log(`[run-once] still waiting (${n} probes, ${Math.round((Date.now() - start) / 1000)}s)`);
-          setTimeout(launch, RELAUNCH_DELAY_MS);
+          if (n % 40 === 0) log(`[run-once] still waiting (${n} probes, ${Math.round((Date.now() - start) / 1000)}s)`);
+          // Back off if the service is rate-limiting / erroring; otherwise keep
+          // the swarm tight to sample replicas fast.
+          const delay = dl.status === 429 || dl.status >= 500 ? BACKOFF_DELAY_MS : RELAUNCH_DELAY_MS;
+          setTimeout(launch, delay);
         })
         .catch(() => {
           inflight -= 1;

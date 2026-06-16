@@ -1,0 +1,38 @@
+name: 'Run once'
+description: >-
+  Run a bash script exactly once across concurrent jobs that share a key. One
+  job wins, runs the script, and caches its stdout; every other job downloads
+  that same output. Distributed run-once / leader election built on the Actions
+  cache service.
+author: 'cnuss'
+
+inputs:
+  key:
+    description: >-
+      Cache key. All jobs that run this action with the same key elect a single
+      winner; the winner runs `run`, the rest reuse its output. Use a key that
+      is unique to the work you want done once (e.g. include a run id, or a
+      content hash for memoization across runs).
+    required: true
+  run:
+    description: >-
+      Bash script executed only on the winning job. Its stdout becomes the
+      `output`. A non-zero exit fails every racer (the winner's exit code and
+      output are propagated to the losers).
+    required: true
+  timeout-seconds:
+    description: 'How long a losing job waits for the winner to finalize before failing.'
+    required: false
+    default: '600'
+
+outputs:
+  output:
+    description: "Stdout of the winning job's script — identical for every racer."
+
+runs:
+  using: 'node24'
+  main: 'index.js'
+
+branding:
+  icon: 'lock'
+  color: 'purple'

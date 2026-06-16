@@ -27,8 +27,15 @@ const { URL } = require('url');
 const { spawnSync } = require('child_process');
 
 const ENVELOPE_VERSION = 'run-once-v1';
-const POLL_INTERVAL_MS = 1500;
+// Losers don't poll serially. They keep POLL_WIDTH probes in flight at once,
+// each on a fresh socket so they fan across the cache's read replicas; the
+// first replica that has ingested the winner's finalize wins the race. This
+// turns convergence from "slowest replica I happen to poll" into "fastest
+// replica in the fleet". RELAUNCH_DELAY_MS paces each slot after a miss.
+const POLL_WIDTH = 8;
+const RELAUNCH_DELAY_MS = 1000;
 const DOWNLOAD_RETRIES = 6;
+const DOWNLOAD_RETRY_DELAY_MS = 1000;
 
 function log(msg) { process.stdout.write(`${msg}\n`); }
 function fail(msg) { log(`::error::${msg}`); process.exitCode = 1; }
@@ -152,38 +159,71 @@ async function runAsWinner({ base, token, key, version, script, uploadUrl }) {
   if (exit !== 0) fail(`winning script exited ${exit}`);
 }
 
-async function runAsLoser({ base, token, key, version, timeoutSeconds }) {
-  const start = Date.now();
-  const deadline = start + timeoutSeconds * 1000;
-  let downloadUrl = '';
-  let polls = 0;
+// Keep POLL_WIDTH concurrent GetCacheEntryDownloadURL probes in flight (each a
+// fresh socket -> different replica). Resolve with the download URL from the
+// first probe that sees the finalized entry, or '' on timeout. No awaits in a
+// loop: the swarm replenishes itself via promise callbacks.
+function raceForVisibility({ base, token, key, version, deadline }) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let settled = false;
+    let inflight = 0;
+    let polls = 0;
 
-  // Poll for visibility. Fresh socket per call rotates replicas.
-  while (Date.now() < deadline) {
-    polls += 1;
-    const dl = await twirp(base, 'GetCacheEntryDownloadURL',
-      { key, version, restore_keys: [] }, token);
-    if (dl.json.ok === true) {
-      downloadUrl = dl.json.signed_download_url || dl.json.signedDownloadUrl;
-      log(`[run-once] entry visible after ${polls} polls / ${Math.round((Date.now() - start) / 1000)}s`);
-      break;
+    const settle = (url) => { if (!settled) { settled = true; resolve(url); } };
+
+    const launch = () => {
+      if (settled) return;
+      if (Date.now() >= deadline) { if (inflight === 0) settle(''); return; }
+      inflight += 1;
+      polls += 1;
+      const n = polls;
+      twirp(base, 'GetCacheEntryDownloadURL', { key, version, restore_keys: [] }, token)
+        .then((dl) => {
+          inflight -= 1;
+          if (settled) return;
+          const url = dl.json.ok === true && (dl.json.signed_download_url || dl.json.signedDownloadUrl);
+          if (url) {
+            log(`[run-once] entry visible after ${n} probes / ${Math.round((Date.now() - start) / 1000)}s`);
+            settle(url);
+            return;
+          }
+          if (n % 20 === 0) log(`[run-once] still waiting (${n} probes, ${Math.round((Date.now() - start) / 1000)}s)`);
+          setTimeout(launch, RELAUNCH_DELAY_MS);
+        })
+        .catch(() => {
+          inflight -= 1;
+          if (!settled) setTimeout(launch, RELAUNCH_DELAY_MS);
+        });
+    };
+
+    for (let i = 0; i < POLL_WIDTH; i += 1) launch();
+  });
+}
+
+// Recursive retry (no loop): blob bytes can lag the metadata. Resolves the body
+// text, or '' if every attempt failed.
+function downloadEnvelope(url, attempt = 1) {
+  return request('GET', url, {}, null).then((res) => {
+    if (res.status === 200) return res.text;
+    if (attempt >= DOWNLOAD_RETRIES) {
+      log(`::error::blob download failed after ${attempt} tries: HTTP ${res.status}`);
+      return '';
     }
-    if (polls % 10 === 0) log(`[run-once] still waiting (${polls} polls, ${Math.round((Date.now() - start) / 1000)}s)`);
-    await sleep(POLL_INTERVAL_MS);
-  }
+    log(`[run-once] blob not ready (HTTP ${res.status}), retry ${attempt}/${DOWNLOAD_RETRIES}`);
+    return sleep(DOWNLOAD_RETRY_DELAY_MS).then(() => downloadEnvelope(url, attempt + 1));
+  });
+}
+
+async function runAsLoser({ base, token, key, version, timeoutSeconds }) {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  const downloadUrl = await raceForVisibility({ base, token, key, version, deadline });
   if (!downloadUrl) {
     return fail(`timed out after ${timeoutSeconds}s waiting for key="${key}" to finalize`);
   }
 
-  // Blob read can lag the metadata; retry on non-200 (e.g. BlobNotFound).
-  let text = '';
-  for (let i = 1; i <= DOWNLOAD_RETRIES; i += 1) {
-    const res = await request('GET', downloadUrl, {}, null);
-    if (res.status === 200) { text = res.text; break; }
-    if (i === DOWNLOAD_RETRIES) return fail(`blob download failed after ${i} tries: HTTP ${res.status}`);
-    log(`[run-once] blob not ready (HTTP ${res.status}), retry ${i}/${DOWNLOAD_RETRIES}`);
-    await sleep(POLL_INTERVAL_MS);
-  }
+  const text = await downloadEnvelope(downloadUrl);
+  if (!text) return fail('could not download winner output');
 
   let envelope;
   try { envelope = JSON.parse(text); } catch { return fail(`winner envelope is not JSON: ${text.slice(0, 200)}`); }

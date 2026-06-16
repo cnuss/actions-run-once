@@ -133,7 +133,7 @@ async function main() {
   const key = getInput('key');
   const script = getInput('run');
   const timeoutSeconds = parseInt(getInput('timeout-seconds') || '600', 10);
-  DEBUG = /^(true|1)$/i.test(getInput('debug')) || process.env.ACTIONS_STEP_DEBUG === 'true';
+  DEBUG = process.env.ACTIONS_STEP_DEBUG === 'true';
   if (!key) return fail('input `key` is required');
   if (!script) return fail('input `run` is required');
 

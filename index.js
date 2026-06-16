@@ -42,9 +42,34 @@ const BACKOFF_DELAY_MS = 3000; // when the service rate-limits / errors (429/5xx
 const DOWNLOAD_RETRIES = 6;
 const DOWNLOAD_RETRY_DELAY_MS = 1000;
 
+let DEBUG = false;
+
 function log(msg) { process.stdout.write(`${msg}\n`); }
 function fail(msg) { log(`::error::${msg}`); process.exitCode = 1; }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Strip Azure SAS secrets (and any token-ish query params) before logging URLs.
+function redactUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    for (const p of ['sig', 'skoid', 'sktid']) {
+      if (u.searchParams.has(p)) u.searchParams.set(p, 'REDACTED');
+    }
+    return `${u.origin}${u.pathname}${u.search}`;
+  } catch { return urlStr; }
+}
+
+// Per-request debug line: method, redacted URL, status, response headers, and a
+// truncated body. Headers often carry x-github-request-id / x-ms-request-id /
+// date which help correlate which backend replica served a probe.
+function logRequest(method, urlStr, res) {
+  if (!DEBUG) return;
+  const body = (res.text || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  log(`::group::[req] ${method} ${res.status} ${redactUrl(urlStr)}`);
+  log(`[req] headers: ${JSON.stringify(res.headers)}`);
+  log(`[req] body: ${body}${(res.text || '').length > 300 ? ' …(truncated)' : ''}`);
+  log('::endgroup::');
+}
 
 function getInput(name) {
   const v = process.env[`INPUT_${name.toUpperCase().replace(/ /g, '_')}`];
@@ -83,7 +108,9 @@ function request(method, urlStr, headers, body) {
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         const buf = Buffer.concat(chunks);
-        resolve({ status: res.statusCode, text: buf.toString('utf8'), buffer: buf });
+        const out = { status: res.statusCode, text: buf.toString('utf8'), buffer: buf, headers: res.headers };
+        logRequest(method, urlStr, out);
+        resolve(out);
       });
     });
     req.on('error', reject);
@@ -106,6 +133,7 @@ async function main() {
   const key = getInput('key');
   const script = getInput('run');
   const timeoutSeconds = parseInt(getInput('timeout-seconds') || '600', 10);
+  DEBUG = /^(true|1)$/i.test(getInput('debug')) || process.env.ACTIONS_STEP_DEBUG === 'true';
   if (!key) return fail('input `key` is required');
   if (!script) return fail('input `run` is required');
 

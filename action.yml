@@ -24,6 +24,13 @@ inputs:
     description: 'How long a losing job waits for the winner to finalize before failing.'
     required: false
     default: '600'
+  debug:
+    description: >-
+      When true, log every HTTP request's method, redacted URL, status,
+      response headers, and a truncated body (also enabled by step debug
+      logging / ACTIONS_STEP_DEBUG=true). SAS signatures are redacted.
+    required: false
+    default: 'false'
 
 outputs:
   output:

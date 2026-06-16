@@ -1,5 +1,10 @@
 # actions-run-once
 
+[![CodeQL](https://github.com/cnuss/actions-run-once/actions/workflows/codeql.yml/badge.svg)](https://github.com/cnuss/actions-run-once/actions/workflows/codeql.yml)
+[![Latest release](https://img.shields.io/github/v/release/cnuss/actions-run-once?sort=semver&logo=github)](https://github.com/cnuss/actions-run-once/releases/latest)
+[![Dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot)](https://github.com/cnuss/actions-run-once/security/dependabot)
+[![Security policy](https://img.shields.io/badge/security-policy-brightgreen)](./SECURITY.md)
+
 Run a bash script **exactly once** across concurrent GitHub Actions jobs that
 share a key — distributed run-once / leader election, built on the Actions
 cache service.
@@ -74,3 +79,13 @@ hash.
 - The reservation is immutable: once a key finalizes, later runs reuse it until
   the cache entry is evicted or deleted. Use a per-run key if you want fresh
   execution each run.
+- **Convergence latency.** The reservation race (`CreateCacheEntry`) is atomic
+  and instant — exactly one winner, always. But a finalized entry becomes
+  visible to the *losers* only as fast as the cache service's read replicas
+  propagate it, which is eventually-consistent: usually sub-second to a few
+  seconds, occasionally tens of seconds, rarely a few minutes. Losers fan a
+  small swarm of concurrent probes across replicas to converge on the fastest
+  one, and wait up to `timeout-seconds`. Treat this as *"run an expensive thing
+  once; the other jobs can afford to wait,"* not as a low-latency mutex.
+- Set `ACTIONS_STEP_DEBUG=true` (or re-run with debug logging) to log every
+  request's method, redacted URL, status, headers, and body.
